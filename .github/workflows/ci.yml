@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore CatalogIngestionLab.slnx
+
+      - name: Verify formatting
+        run: dotnet format CatalogIngestionLab.slnx --verify-no-changes --no-restore
+
+      - name: Build
+        run: dotnet build CatalogIngestionLab.slnx --configuration Release --no-restore
+
+      - name: Test
+        run: >-
+          dotnet test CatalogIngestionLab.slnx
+          --configuration Release
+          --no-build
+          --collect:"XPlat Code Coverage"
+          --results-directory TestResults
+
+      - name: Audit dependencies
+        run: dotnet list CatalogIngestionLab.slnx package --vulnerable --include-transitive
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage
+          path: TestResults/**/coverage.cobertura.xml
+          if-no-files-found: error
+
+      - name: Build container
+        run: docker build --tag catalog-ingestion-lab:${{ github.sha }} .
