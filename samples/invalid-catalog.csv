@@ -1,0 +1,3 @@
+sku,name,price,currency,stock
+BAD SKU,Invalid SKU,1.999,US,-1
+BAD SKU,Duplicate invalid SKU,12.00,USD,5

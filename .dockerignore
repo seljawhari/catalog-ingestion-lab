@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+.vscode
+**/bin
+**/obj
+**/TestResults
+data
+*.db
+*.db-shm
+*.db-wal
+README.md

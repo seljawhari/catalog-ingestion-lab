@@ -1,0 +1,16 @@
+[
+  {
+    "sku": "widget-004",
+    "name": "Field Widget",
+    "price": 39.99,
+    "currency": "usd",
+    "stock": 64
+  },
+  {
+    "sku": "gadget-005",
+    "name": "Bench Gadget",
+    "price": 18.5,
+    "currency": "usd",
+    "stock": 27
+  }
+]
