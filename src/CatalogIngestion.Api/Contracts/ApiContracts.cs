@@ -19,7 +19,8 @@ public sealed record IngestionJobResponse(
     DateTimeOffset UpdatedAt,
     DateTimeOffset? NextAttemptAt,
     string? LastError,
-    IReadOnlyList<ValidationIssue> ValidationIssues)
+    IReadOnlyList<ValidationIssue> ValidationIssues,
+    bool Requeueable)
 {
     public static IngestionJobResponse From(IngestionJob job) => new(
         job.Id,
@@ -32,7 +33,8 @@ public sealed record IngestionJobResponse(
         job.UpdatedAt,
         job.NextAttemptAt,
         job.LastError,
-        job.ValidationIssues);
+        job.ValidationIssues,
+        job.Status == IngestionStatus.DeadLettered && job.PayloadRetained);
 }
 
 public sealed record CatalogItemResponse(

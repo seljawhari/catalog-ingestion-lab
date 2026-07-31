@@ -67,7 +67,7 @@ stateDiagram-v2
     Processing --> Completed: atomic catalog commit
     Processing --> RetryScheduled: transient failure / attempts remain
     Processing --> DeadLettered: invalid input or attempt limit
-    DeadLettered --> Queued: operator requeue
+    DeadLettered --> Queued: operator requeue + fresh sequence
     Completed --> [*]
 ```
 
@@ -77,11 +77,13 @@ Validation failures share the terminal `DeadLettered` representation in this com
 
 - The payload is stored as a BLOB in the same row as the job, avoiding a database/filesystem atomicity gap.
 - SQLite uses WAL mode, full synchronous writes, foreign keys, and a finite busy timeout.
-- The dispatcher selects and updates one eligible job inside a serializable transaction; parsing happens after that transaction closes.
+- Each accepted job receives a monotonic submission sequence in the same transaction as its insert.
+- The dispatcher selects and updates only the oldest active sequence inside a serializable transaction; parsing happens after that transaction closes.
 - Catalog changes and successful acknowledgement share one transaction.
-- The worker processes one job at a time, so an older job cannot race a newer job inside this deployment model.
+- An automatic retry keeps its original sequence and temporarily blocks newer work until it succeeds, exhausts its bounded attempts, or dead-letters. This prevents stale retry writes without weakening batch atomicity.
+- Manual requeue assigns a fresh sequence because it is a new operator decision after the original job became terminal.
 - On startup, `Processing` rows are moved to retry or dead-letter state based on their persisted attempt count.
-- Completed payloads are removed to bound storage. Dead-letter payloads remain available for explicit requeue.
+- Completed payloads are removed. Dead-letter metadata remains queryable, but only the configured number of newest dead-letter BLOBs are retained for explicit requeue; older payloads are pruned atomically when a job dead-letters and again at startup.
 
 SQLite's asynchronous APIs execute synchronously underneath. Transactions are intentionally short and batches are capped. This design supports a single local process on a local disk. WAL still has one writer and depends on same-machine file locking; network filesystems and multiple replicas are unsupported.
 
@@ -91,7 +93,7 @@ When the single-process constraint stops fitting:
 
 1. Implement `ICatalogStore` with PostgreSQL and use row locking (`FOR UPDATE SKIP LOCKED`) or publish durable job IDs to a managed queue.
 2. Add renewable leases and fencing tokens before allowing concurrent workers.
-3. Persist submission sequence on catalog rows so older work cannot overwrite newer accepted state.
+3. Preserve the submission sequence in the scaled design; if workers become concurrent, carry it into catalog rows or add an equivalent version guard so late work cannot regress newer values.
 4. Stage large batches and merge them set-wise instead of issuing one upsert per row.
 5. Export the existing `ActivitySource` and `Meter` through an OpenTelemetry collector.
 
@@ -99,4 +101,4 @@ Those are deliberate next-stage investments, not hidden guarantees of this local
 
 ## Security posture
 
-The service assumes deployment behind an authenticated gateway. It applies input, body, row, query, and rate bounds; strips file paths; does not execute uploaded content; avoids reflecting parser exceptions; and runs non-root in the supplied container. See [SECURITY.md](../SECURITY.md) for trust boundaries and reporting.
+The service assumes deployment behind an authenticated gateway. It applies input, body, row, query, rate, and retained-dead-letter bounds; strips file paths; does not execute uploaded content; avoids reflecting parser exceptions; and runs non-root in the supplied container. See [SECURITY.md](../SECURITY.md) for trust boundaries and reporting.

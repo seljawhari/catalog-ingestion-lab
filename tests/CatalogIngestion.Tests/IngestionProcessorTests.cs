@@ -27,7 +27,7 @@ public sealed class IngestionProcessorTests : IAsyncLifetime
                 ["ConnectionStrings:Catalog"] = $"Data Source={Path.Combine(_directory, "catalog.db")};Default Timeout=5",
             })
             .Build();
-        _store = new SqliteCatalogStore(configuration);
+        _store = new SqliteCatalogStore(configuration, Options.Create(new IngestionOptions()));
         await _store.InitializeAsync(CancellationToken.None);
     }
 

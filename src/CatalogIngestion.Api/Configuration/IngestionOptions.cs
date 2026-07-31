@@ -14,5 +14,7 @@ public sealed class IngestionOptions
 
     public int RetryBaseDelaySeconds { get; init; } = 2;
 
+    public int MaxRetainedDeadLetterPayloads { get; init; } = 20;
+
     public bool WorkerEnabled { get; init; } = true;
 }

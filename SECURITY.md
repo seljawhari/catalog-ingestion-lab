@@ -22,6 +22,8 @@ Uploads and all headers are untrusted. The service:
 - uses parameterized SQL throughout;
 - runs as a non-root user in the supplied container.
 
+Dead-letter metadata remains available for diagnosis, but retained payload BLOBs are capped by `Ingestion__MaxRetainedDeadLetterPayloads` (20 by default). Older BLOBs are cleared and report `requeueable: false`; setting the cap to zero disables payload retention. Active queued work still requires normal deployment-level disk monitoring and admission control.
+
 The sample does **not** implement end-user authentication or authorization. Deploy it behind an authenticated gateway, terminate TLS at a trusted edge, restrict dead-letter/requeue routes to operators, and protect the data volume with platform access controls and backups. Do not use the SQLite volume on a network filesystem or mount it into multiple replicas.
 
 No credentials are required by the application. Do not commit secrets in configuration; use the deployment platform's secret provider for any future exporter, gateway, or database credentials.

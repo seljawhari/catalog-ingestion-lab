@@ -1,8 +1,10 @@
 using System.Security.Cryptography;
 using System.Text;
+using CatalogIngestion.Api.Configuration;
 using CatalogIngestion.Api.Domain;
 using CatalogIngestion.Api.Persistence;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
 
 namespace CatalogIngestion.Tests;
 
@@ -23,7 +25,7 @@ public sealed class SqliteCatalogStoreTests : IAsyncLifetime
                 ["ConnectionStrings:Catalog"] = _connectionString,
             })
             .Build();
-        _store = new SqliteCatalogStore(configuration);
+        _store = new SqliteCatalogStore(configuration, Options.Create(new IngestionOptions()));
         await _store.InitializeAsync(CancellationToken.None);
     }
 
@@ -96,7 +98,7 @@ public sealed class SqliteCatalogStoreTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task FailAndRequeue_PreservesDeadLetterPayloadForManualRecovery()
+    public async Task FailAndRequeue_PreservesPayloadAndJoinsTailAsNewOperatorDecision()
     {
         DateTimeOffset now = DateTimeOffset.Parse("2026-07-30T12:00:00Z");
         CreateIngestionResult created = await _store.CreateOrGetIngestionAsync(
@@ -113,9 +115,12 @@ public sealed class SqliteCatalogStoreTests : IAsyncLifetime
             retryAt: null,
             now.AddSeconds(1),
             CancellationToken.None);
+        CreateIngestionResult newer = await _store.CreateOrGetIngestionAsync(
+            Request("catalog-batch-004", Encoding.UTF8.GetBytes("newer"), now.AddSeconds(2)),
+            CancellationToken.None);
         RequeueOutcome requeue = await _store.RequeueDeadLetterAsync(
             created.Job.Id,
-            now.AddSeconds(2),
+            now.AddSeconds(3),
             CancellationToken.None);
 
         Assert.Equal(IngestionStatus.DeadLettered, status);
@@ -123,6 +128,9 @@ public sealed class SqliteCatalogStoreTests : IAsyncLifetime
         IngestionJob queued = Assert.IsType<IngestionJob>(
             await _store.GetIngestionAsync(created.Job.Id, CancellationToken.None));
         Assert.Equal(IngestionStatus.Queued, queued.Status);
+        ClaimedIngestionJob next = Assert.IsType<ClaimedIngestionJob>(
+            await _store.ClaimNextIngestionAsync(now.AddSeconds(3), CancellationToken.None));
+        Assert.Equal(newer.Job.Id, next.Id);
     }
 
     [Fact]
@@ -145,7 +153,97 @@ public sealed class SqliteCatalogStoreTests : IAsyncLifetime
         Assert.Equal(now.AddMinutes(1), recovered.NextAttemptAt);
     }
 
-    private static SqliteCatalogStore CreateStore(string connectionString)
+    [Fact]
+    public async Task ScheduledRetry_BlocksNewerSubmissionSoLatestAcceptedValueWins()
+    {
+        DateTimeOffset now = DateTimeOffset.Parse("2026-07-30T12:00:00Z");
+        CreateIngestionResult older = await _store.CreateOrGetIngestionAsync(
+            Request("catalog-ordered-old", Encoding.UTF8.GetBytes("old"), now),
+            CancellationToken.None);
+        ClaimedIngestionJob firstAttempt = Assert.IsType<ClaimedIngestionJob>(
+            await _store.ClaimNextIngestionAsync(now, CancellationToken.None));
+        await _store.FailIngestionAsync(
+            firstAttempt,
+            "Synthetic transient failure.",
+            [],
+            retryable: true,
+            now.AddSeconds(10),
+            now.AddSeconds(1),
+            CancellationToken.None);
+
+        CreateIngestionResult newer = await _store.CreateOrGetIngestionAsync(
+            Request("catalog-ordered-new", Encoding.UTF8.GetBytes("new"), now.AddSeconds(2)),
+            CancellationToken.None);
+
+        Assert.Null(await _store.ClaimNextIngestionAsync(now.AddSeconds(5), CancellationToken.None));
+
+        ClaimedIngestionJob retry = Assert.IsType<ClaimedIngestionJob>(
+            await _store.ClaimNextIngestionAsync(now.AddSeconds(10), CancellationToken.None));
+        Assert.Equal(older.Job.Id, retry.Id);
+        await _store.CompleteIngestionAsync(
+            retry,
+            [new ParsedCatalogItem("SKU-ORDERED", "Older value", 100, "USD", 1)],
+            now.AddSeconds(11),
+            CancellationToken.None);
+
+        ClaimedIngestionJob next = Assert.IsType<ClaimedIngestionJob>(
+            await _store.ClaimNextIngestionAsync(now.AddSeconds(11), CancellationToken.None));
+        Assert.Equal(newer.Job.Id, next.Id);
+        await _store.CompleteIngestionAsync(
+            next,
+            [new ParsedCatalogItem("SKU-ORDERED", "Newest accepted value", 200, "USD", 2)],
+            now.AddSeconds(12),
+            CancellationToken.None);
+
+        CatalogItem item = Assert.IsType<CatalogItem>(
+            await _store.GetCatalogItemAsync("SKU-ORDERED", CancellationToken.None));
+        Assert.Equal("Newest accepted value", item.Name);
+        Assert.Equal(newer.Job.Id, item.SourceJobId);
+    }
+
+    [Fact]
+    public async Task DeadLetters_RetainOnlyConfiguredNumberOfPayloads()
+    {
+        SqliteCatalogStore boundedStore = CreateStore(_connectionString, maxRetainedDeadLetterPayloads: 2);
+        DateTimeOffset now = DateTimeOffset.Parse("2026-07-30T12:00:00Z");
+        List<Guid> jobIds = [];
+
+        for (int index = 0; index < 3; index++)
+        {
+            CreateIngestionResult created = await boundedStore.CreateOrGetIngestionAsync(
+                Request(
+                    $"catalog-retention-{index:D3}",
+                    Encoding.UTF8.GetBytes($"invalid-{index}"),
+                    now.AddSeconds(index),
+                    maxAttempts: 1),
+                CancellationToken.None);
+            jobIds.Add(created.Job.Id);
+            ClaimedIngestionJob claimed = Assert.IsType<ClaimedIngestionJob>(
+                await boundedStore.ClaimNextIngestionAsync(now.AddSeconds(index), CancellationToken.None));
+            await boundedStore.FailIngestionAsync(
+                claimed,
+                "Payload validation failed.",
+                [new ValidationIssue(1, "sku", "SKU is invalid.")],
+                retryable: false,
+                retryAt: null,
+                now.AddSeconds(index),
+                CancellationToken.None);
+        }
+
+        IReadOnlyList<IngestionJob> deadLetters = await boundedStore.ListDeadLettersAsync(
+            10,
+            CancellationToken.None);
+        Assert.Equal(3, deadLetters.Count);
+        Assert.Equal(2, deadLetters.Count(job => job.PayloadRetained));
+        Assert.False((await boundedStore.GetIngestionAsync(jobIds[0], CancellationToken.None))!.PayloadRetained);
+        Assert.Equal(
+            RequeueOutcome.NotRequeueable,
+            await boundedStore.RequeueDeadLetterAsync(jobIds[0], now.AddMinutes(1), CancellationToken.None));
+    }
+
+    private static SqliteCatalogStore CreateStore(
+        string connectionString,
+        int maxRetainedDeadLetterPayloads = 20)
     {
         IConfiguration configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>
@@ -153,7 +251,12 @@ public sealed class SqliteCatalogStoreTests : IAsyncLifetime
                 ["ConnectionStrings:Catalog"] = connectionString,
             })
             .Build();
-        return new SqliteCatalogStore(configuration);
+        return new SqliteCatalogStore(
+            configuration,
+            Options.Create(new IngestionOptions
+            {
+                MaxRetainedDeadLetterPayloads = maxRetainedDeadLetterPayloads,
+            }));
     }
 
     private static CreateIngestionRequest Request(

@@ -1,8 +1,10 @@
 using System.Data;
 using System.Globalization;
 using System.Text.Json;
+using CatalogIngestion.Api.Configuration;
 using CatalogIngestion.Api.Domain;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Options;
 
 namespace CatalogIngestion.Api.Persistence;
 
@@ -14,11 +16,13 @@ public sealed class SqliteCatalogStore : ICatalogStore
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly string _connectionString;
+    private readonly int _maxRetainedDeadLetterPayloads;
 
-    public SqliteCatalogStore(IConfiguration configuration)
+    public SqliteCatalogStore(IConfiguration configuration, IOptions<IngestionOptions> options)
     {
         _connectionString = configuration.GetConnectionString("Catalog")
             ?? throw new InvalidOperationException("ConnectionStrings:Catalog is required.");
+        _maxRetainedDeadLetterPayloads = options.Value.MaxRetainedDeadLetterPayloads;
     }
 
     public async Task InitializeAsync(CancellationToken cancellationToken)
@@ -82,12 +86,17 @@ public sealed class SqliteCatalogStore : ICatalogStore
             """;
         command.Parameters.AddWithValue("$appliedAt", FormatTimestamp(DateTimeOffset.UtcNow));
         await command.ExecuteNonQueryAsync(cancellationToken);
+
+        await ApplySubmissionOrderingMigrationAsync(connection, cancellationToken);
+        await PruneDeadLetterPayloadsAsync(connection, transaction: null, cancellationToken);
     }
 
     public async Task RequeueInterruptedJobsAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
         await using SqliteConnection connection = await OpenConnectionAsync(cancellationToken);
+        using SqliteTransaction transaction = connection.BeginTransaction(IsolationLevel.Serializable);
         await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             UPDATE ingestion_jobs
             SET status = CASE
@@ -104,6 +113,8 @@ public sealed class SqliteCatalogStore : ICatalogStore
             """;
         command.Parameters.AddWithValue("$now", FormatTimestamp(now));
         await command.ExecuteNonQueryAsync(cancellationToken);
+        await PruneDeadLetterPayloadsAsync(connection, transaction, cancellationToken);
+        transaction.Commit();
     }
 
     public async Task<CreateIngestionResult> CreateOrGetIngestionAsync(
@@ -125,15 +136,19 @@ public sealed class SqliteCatalogStore : ICatalogStore
         }
 
         Guid jobId = Guid.NewGuid();
+        using SqliteTransaction transaction = connection.BeginTransaction(IsolationLevel.Serializable);
+        long submissionSequence = await AllocateSubmissionSequenceAsync(connection, transaction, cancellationToken);
         await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             INSERT INTO ingestion_jobs (
                 id, idempotency_key, payload_hash, payload_format, original_file_name, payload,
                 status, attempt_count, max_attempts, next_attempt_at, created_at, updated_at,
-                last_error, validation_errors_json
+                last_error, validation_errors_json, submission_sequence
             ) VALUES (
                 $id, $idempotencyKey, $payloadHash, $payloadFormat, $originalFileName, $payload,
-                'Queued', 0, $maxAttempts, NULL, $createdAt, $createdAt, NULL, '[]'
+                'Queued', 0, $maxAttempts, NULL, $createdAt, $createdAt, NULL, '[]',
+                $submissionSequence
             );
             """;
         command.Parameters.AddWithValue("$id", jobId.ToString("D"));
@@ -144,13 +159,16 @@ public sealed class SqliteCatalogStore : ICatalogStore
         command.Parameters.Add("$payload", SqliteType.Blob).Value = request.Payload;
         command.Parameters.AddWithValue("$maxAttempts", request.MaxAttempts);
         command.Parameters.AddWithValue("$createdAt", FormatTimestamp(request.CreatedAt));
+        command.Parameters.AddWithValue("$submissionSequence", submissionSequence);
 
         try
         {
             await command.ExecuteNonQueryAsync(cancellationToken);
+            transaction.Commit();
         }
         catch (SqliteException exception) when (exception.SqliteErrorCode == SqliteConstraintError)
         {
+            transaction.Rollback();
             existing = await FindByIdempotencyKeyAsync(connection, request.IdempotencyKey, cancellationToken);
             if (existing is null)
             {
@@ -174,7 +192,8 @@ public sealed class SqliteCatalogStore : ICatalogStore
             request.CreatedAt,
             null,
             null,
-            []);
+            [],
+            PayloadRetained: true);
         return new CreateIngestionResult(CreateIngestionOutcome.Created, job);
     }
 
@@ -209,11 +228,16 @@ public sealed class SqliteCatalogStore : ICatalogStore
                 SELECT id, payload_format, payload, attempt_count, max_attempts, status
                 FROM ingestion_jobs
                 WHERE payload IS NOT NULL
+                  AND submission_sequence = (
+                    SELECT MIN(submission_sequence)
+                    FROM ingestion_jobs
+                    WHERE status IN ('Queued', 'Processing', 'RetryScheduled')
+                      AND payload IS NOT NULL
+                  )
                   AND (
                     status = 'Queued'
                     OR (status = 'RetryScheduled' AND next_attempt_at <= $now)
                   )
-                ORDER BY created_at, id
                 LIMIT 1;
                 """;
             select.Parameters.AddWithValue("$now", FormatTimestamp(now));
@@ -333,7 +357,9 @@ public sealed class SqliteCatalogStore : ICatalogStore
             : IngestionStatus.DeadLettered;
 
         await using SqliteConnection connection = await OpenConnectionAsync(cancellationToken);
+        using SqliteTransaction transaction = connection.BeginTransaction(IsolationLevel.Serializable);
         await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             UPDATE ingestion_jobs
             SET status = $status,
@@ -353,9 +379,16 @@ public sealed class SqliteCatalogStore : ICatalogStore
         command.Parameters.AddWithValue("$id", job.Id.ToString("D"));
         if (await command.ExecuteNonQueryAsync(cancellationToken) != 1)
         {
+            transaction.Rollback();
             throw new InvalidOperationException($"Ingestion job {job.Id} was not in Processing state.");
         }
 
+        if (status == IngestionStatus.DeadLettered)
+        {
+            await PruneDeadLetterPayloadsAsync(connection, transaction, cancellationToken);
+        }
+
+        transaction.Commit();
         return status;
     }
 
@@ -365,7 +398,43 @@ public sealed class SqliteCatalogStore : ICatalogStore
         CancellationToken cancellationToken)
     {
         await using SqliteConnection connection = await OpenConnectionAsync(cancellationToken);
+        using SqliteTransaction transaction = connection.BeginTransaction(IsolationLevel.Serializable);
+
+        string? status = null;
+        bool payloadRetained = false;
+        await using (SqliteCommand read = connection.CreateCommand())
+        {
+            read.Transaction = transaction;
+            read.CommandText = """
+                SELECT status, payload IS NOT NULL
+                FROM ingestion_jobs
+                WHERE id = $id;
+                """;
+            read.Parameters.AddWithValue("$id", jobId.ToString("D"));
+            await using SqliteDataReader reader = await read.ExecuteReaderAsync(cancellationToken);
+            if (await reader.ReadAsync(cancellationToken))
+            {
+                status = reader.GetString(0);
+                payloadRetained = reader.GetBoolean(1);
+            }
+        }
+
+        if (status is null)
+        {
+            transaction.Rollback();
+            return RequeueOutcome.NotFound;
+        }
+
+        if (!string.Equals(status, IngestionStatus.DeadLettered.ToString(), StringComparison.Ordinal)
+            || !payloadRetained)
+        {
+            transaction.Rollback();
+            return RequeueOutcome.NotRequeueable;
+        }
+
+        long submissionSequence = await AllocateSubmissionSequenceAsync(connection, transaction, cancellationToken);
         await using SqliteCommand update = connection.CreateCommand();
+        update.Transaction = transaction;
         update.CommandText = """
             UPDATE ingestion_jobs
             SET status = 'Queued',
@@ -373,21 +442,21 @@ public sealed class SqliteCatalogStore : ICatalogStore
                 next_attempt_at = NULL,
                 updated_at = $now,
                 last_error = NULL,
-                validation_errors_json = '[]'
+                validation_errors_json = '[]',
+                submission_sequence = $submissionSequence
             WHERE id = $id AND status = 'DeadLettered' AND payload IS NOT NULL;
             """;
         update.Parameters.AddWithValue("$now", FormatTimestamp(now));
         update.Parameters.AddWithValue("$id", jobId.ToString("D"));
-        if (await update.ExecuteNonQueryAsync(cancellationToken) == 1)
+        update.Parameters.AddWithValue("$submissionSequence", submissionSequence);
+        if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
         {
-            return RequeueOutcome.Requeued;
+            transaction.Rollback();
+            throw new InvalidOperationException($"Dead-lettered job {jobId} changed during requeue.");
         }
 
-        await using SqliteCommand exists = connection.CreateCommand();
-        exists.CommandText = "SELECT status FROM ingestion_jobs WHERE id = $id;";
-        exists.Parameters.AddWithValue("$id", jobId.ToString("D"));
-        object? value = await exists.ExecuteScalarAsync(cancellationToken);
-        return value is null ? RequeueOutcome.NotFound : RequeueOutcome.NotDeadLettered;
+        transaction.Commit();
+        return RequeueOutcome.Requeued;
     }
 
     public async Task<IReadOnlyList<IngestionJob>> ListDeadLettersAsync(
@@ -471,9 +540,99 @@ public sealed class SqliteCatalogStore : ICatalogStore
         }
     }
 
+    private static async Task ApplySubmissionOrderingMigrationAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        using SqliteTransaction transaction = connection.BeginTransaction(IsolationLevel.Serializable);
+        await using SqliteCommand applied = connection.CreateCommand();
+        applied.Transaction = transaction;
+        applied.CommandText = "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 2);";
+        if (Convert.ToInt32(
+                await applied.ExecuteScalarAsync(cancellationToken),
+                CultureInfo.InvariantCulture) == 1)
+        {
+            transaction.Commit();
+            return;
+        }
+
+        await using SqliteCommand migrate = connection.CreateCommand();
+        migrate.Transaction = transaction;
+        migrate.CommandText = """
+            ALTER TABLE ingestion_jobs
+                ADD COLUMN submission_sequence INTEGER NOT NULL DEFAULT 0;
+
+            UPDATE ingestion_jobs
+            SET submission_sequence = rowid
+            WHERE submission_sequence = 0;
+
+            CREATE UNIQUE INDEX ux_ingestion_jobs_submission_sequence
+                ON ingestion_jobs(submission_sequence);
+
+            CREATE TABLE ingestion_sequence (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                next_value INTEGER NOT NULL CHECK (next_value > 0)
+            );
+
+            INSERT INTO ingestion_sequence(singleton, next_value)
+            SELECT 1, COALESCE(MAX(submission_sequence), 0) + 1
+            FROM ingestion_jobs;
+
+            INSERT INTO schema_migrations(version, applied_at)
+                VALUES (2, $appliedAt);
+            """;
+        migrate.Parameters.AddWithValue("$appliedAt", FormatTimestamp(DateTimeOffset.UtcNow));
+        await migrate.ExecuteNonQueryAsync(cancellationToken);
+        transaction.Commit();
+    }
+
+    private static async Task<long> AllocateSubmissionSequenceAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE ingestion_sequence
+            SET next_value = next_value + 1
+            WHERE singleton = 1
+            RETURNING next_value - 1;
+            """;
+        object? value = await command.ExecuteScalarAsync(cancellationToken);
+        return value is null
+            ? throw new InvalidOperationException("The ingestion submission sequence is not initialized.")
+            : Convert.ToInt64(value, CultureInfo.InvariantCulture);
+    }
+
+    private async Task PruneDeadLetterPayloadsAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        CancellationToken cancellationToken)
+    {
+        await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE ingestion_jobs
+            SET payload = NULL
+            WHERE status = 'DeadLettered'
+              AND payload IS NOT NULL
+              AND id NOT IN (
+                SELECT id
+                FROM ingestion_jobs
+                WHERE status = 'DeadLettered' AND payload IS NOT NULL
+                ORDER BY updated_at DESC, submission_sequence DESC
+                LIMIT $retainedPayloads
+              );
+            """;
+        command.Parameters.AddWithValue("$retainedPayloads", _maxRetainedDeadLetterPayloads);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
     private const string JobColumns = """
         id, status, payload_format, original_file_name, attempt_count, max_attempts,
-        created_at, updated_at, next_attempt_at, last_error, validation_errors_json
+        created_at, updated_at, next_attempt_at, last_error, validation_errors_json,
+        payload IS NOT NULL
         """;
 
     private async Task<SqliteConnection> OpenConnectionAsync(CancellationToken cancellationToken)
@@ -504,7 +663,7 @@ public sealed class SqliteCatalogStore : ICatalogStore
             return null;
         }
 
-        return new IngestionJobWithHash(ReadJob(reader), reader.GetString(11));
+        return new IngestionJobWithHash(ReadJob(reader), reader.GetString(12));
     }
 
     private static IngestionJob ReadJob(SqliteDataReader reader)
@@ -524,7 +683,8 @@ public sealed class SqliteCatalogStore : ICatalogStore
             ParseTimestamp(reader.GetString(7)),
             reader.IsDBNull(8) ? null : ParseTimestamp(reader.GetString(8)),
             reader.IsDBNull(9) ? null : reader.GetString(9),
-            issues);
+            issues,
+            reader.GetBoolean(11));
     }
 
     private static CatalogItem ReadCatalogItem(SqliteDataReader reader) => new(

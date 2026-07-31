@@ -21,6 +21,9 @@ builder.Services
     .Validate(options => options.MaxAttempts is >= 1 and <= 10, "MaxAttempts must be 1-10.")
     .Validate(options => options.PollIntervalMilliseconds is >= 25 and <= 60_000, "PollIntervalMilliseconds must be 25-60,000.")
     .Validate(options => options.RetryBaseDelaySeconds is >= 1 and <= 60, "RetryBaseDelaySeconds must be 1-60.")
+    .Validate(
+        options => options.MaxRetainedDeadLetterPayloads is >= 0 and <= 100,
+        "MaxRetainedDeadLetterPayloads must be 0-100.")
     .ValidateOnStart();
 
 int maxPayloadBytes = builder.Configuration.GetValue<int?>("Ingestion:MaxPayloadBytes") ?? 5 * 1024 * 1024;
@@ -251,7 +254,7 @@ app.MapPost("/v1/dead-letters/{jobId:guid}/requeue", async (
     {
         RequeueOutcome.Requeued => Results.Accepted($"/v1/ingestions/{jobId:D}", new { jobId, status = "Queued" }),
         RequeueOutcome.NotFound => Results.NotFound(),
-        RequeueOutcome.NotDeadLettered => Results.Conflict(new
+        RequeueOutcome.NotRequeueable => Results.Conflict(new
         {
             title = "Job is not requeueable",
             detail = "Only dead-lettered jobs with a retained payload can be requeued.",

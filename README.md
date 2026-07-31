@@ -1,5 +1,7 @@
 # Catalog Ingestion Lab
 
+[![CI](https://github.com/seljawhari/catalog-ingestion-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/seljawhari/catalog-ingestion-lab/actions/workflows/ci.yml)
+
 A production-minded .NET 10 reference service for accepting CSV and JSON product catalogs, validating them asynchronously, and applying an all-or-nothing upsert to a queryable catalog.
 
 The project intentionally focuses on the failure modes that make ingestion systems interesting: duplicate submissions, malformed source data, interrupted workers, bounded retries, dead letters, and atomic writes. The domain and all sample data are synthetic.
@@ -10,7 +12,8 @@ The project intentionally focuses on the failure modes that make ingestion syste
 - Durable SQLite-backed job state: `Queued`, `Processing`, `RetryScheduled`, `Completed`, and `DeadLettered`
 - Strict CSV/JSON parsing, row-level validation, normalized SKUs, and integer minor-unit money storage
 - Atomic catalog upserts: a file either applies completely or makes no catalog changes
-- Exponential retry scheduling, persisted dead letters, and an explicit requeue endpoint
+- Exponential retries that preserve accepted order, persisted dead letters, and an explicit requeue endpoint
+- Bounded dead-letter payload retention while keeping lightweight failure metadata
 - Startup recovery for work interrupted by a process stop
 - Structured logs, correlation IDs, custom `ActivitySource` spans, and `Meter` counters/histograms
 - Request-size, row-count, rate, and query bounds
@@ -91,7 +94,7 @@ JSON must be an array of objects with exactly the same five fields. Unknown JSON
 | Method | Route | Purpose |
 | --- | --- | --- |
 | `POST` | `/v1/ingestions` | Persist a CSV/JSON upload; requires `Idempotency-Key` |
-| `GET` | `/v1/ingestions/{jobId}` | Read status, attempts, and validation details |
+| `GET` | `/v1/ingestions/{jobId}` | Read status, attempts, validation details, and `requeueable` |
 | `GET` | `/v1/catalog/items` | Page through catalog items with `limit` and `afterSku` |
 | `GET` | `/v1/catalog/items/{sku}` | Read one normalized catalog item |
 | `GET` | `/v1/dead-letters` | Inspect failed jobs |
@@ -101,14 +104,16 @@ JSON must be an array of objects with exactly the same five fields. Unknown JSON
 
 - A submission is acknowledged only after its immutable payload and job record are durable.
 - A unique idempotency key plus SHA-256 payload hash makes client retries deterministic.
-- Claiming a job transitions it to `Processing` in a short serializable transaction.
+- Each accepted submission receives a durable monotonic sequence; the worker only claims the oldest active sequence.
+- A scheduled automatic retry holds its place, so a newer accepted batch cannot be applied first and later overwritten by stale work.
 - Successful item upserts and the `Completed` transition share one transaction.
 - Validation failures never write partial catalog rows and are not retried.
 - Unexpected processing failures use bounded exponential retries, then become dead letters.
-- Completed payloads are cleared; failed payloads are retained so operators can requeue them.
+- Completed payloads are cleared. By default only the 20 newest dead-letter payloads are retained for requeue; older failure metadata remains queryable with `requeueable: false`.
 - Startup recovery reschedules any job left in `Processing` by an interrupted worker.
+- Manual requeue is an explicit new operator decision, so the job receives a fresh sequence and rejoins the tail of the active queue.
 
-This sample has one worker and one process by design. It does not claim distributed exactly-once processing. The idempotency and atomic-commit boundaries provide the useful application-level guarantee: repeated client submissions do not create duplicate jobs, and a catalog batch is applied at most once by the local worker.
+Strict ordering can briefly hold newer work behind an older scheduled retry; retry delays and attempts are bounded. This sample has one worker and one process by design. It does not claim distributed exactly-once processing. The idempotency, ordering, and atomic-commit boundaries provide the useful application-level guarantee: repeated client submissions do not create duplicate jobs, accepted batches cannot be applied out of order, and a catalog batch is applied at most once by the local worker.
 
 ## Observability
 
@@ -142,8 +147,11 @@ Ingestion__MaxItems
 Ingestion__MaxAttempts
 Ingestion__PollIntervalMilliseconds
 Ingestion__RetryBaseDelaySeconds
+Ingestion__MaxRetainedDeadLetterPayloads
 Ingestion__WorkerEnabled
 ```
+
+`MaxRetainedDeadLetterPayloads` defaults to 20 and may be set from 0 through 100. Pruning clears only the uploaded payload BLOB; status, timestamps, filename, attempts, and validation details remain available. The maximum retained dead-letter bytes are therefore bounded by this value multiplied by `MaxPayloadBytes` (100 MiB with both defaults).
 
 ## Scope and provenance
 

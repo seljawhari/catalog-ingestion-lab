@@ -28,7 +28,8 @@ public sealed record IngestionJob(
     DateTimeOffset UpdatedAt,
     DateTimeOffset? NextAttemptAt,
     string? LastError,
-    IReadOnlyList<ValidationIssue> ValidationIssues);
+    IReadOnlyList<ValidationIssue> ValidationIssues,
+    bool PayloadRetained);
 
 public sealed record ClaimedIngestionJob(
     Guid Id,

@@ -26,7 +26,7 @@ public enum RequeueOutcome
 {
     Requeued,
     NotFound,
-    NotDeadLettered,
+    NotRequeueable,
 }
 
 public interface ICatalogStore
